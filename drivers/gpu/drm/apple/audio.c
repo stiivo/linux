@@ -33,6 +33,13 @@
 #define DCPAUD_ELEMENTS_MAXSIZE		16384
 #define DCPAUD_PRODUCTATTRS_MAXSIZE	1024
 
+/*
+ * Half of the SIO coprocessor's descriptor pool (SIO_NO_DESC_SLOTS == 64 in
+ * drivers/dma/apple-sio.c). One descriptor is consumed per period, and the
+ * pool is shared by both dpaudio controllers.
+ */
+#define DCPAUD_MAX_PERIODS		32
+
 struct dcp_audio {
 	struct device *dev;
 	struct device *dcp_dev;
@@ -71,7 +78,7 @@ static const struct snd_pcm_hardware dcp_pcm_hw = {
 	.period_bytes_min	= 4096, /* TODO */
 	.period_bytes_max	= SIZE_MAX,
 	.periods_min		= 2,
-	.periods_max		= UINT_MAX,
+	.periods_max		= DCPAUD_MAX_PERIODS,
 };
 
 static int dcpaud_read_remote_info(struct dcp_audio *dcpaud)
@@ -279,7 +286,7 @@ static int dcp_pcm_open(struct snd_pcm_substream *substream)
 	hw.info = SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_MMAP_VALID |
 			  SNDRV_PCM_INFO_INTERLEAVED;
 	hw.periods_min = 2;
-	hw.periods_max = UINT_MAX;
+	hw.periods_max = DCPAUD_MAX_PERIODS;
 	hw.period_bytes_min = 256;
 	hw.period_bytes_max = SIZE_MAX; // TODO dma_get_max_seg_size(dma_dev);
 	hw.buffer_bytes_max = SIZE_MAX;
