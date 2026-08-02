@@ -23,6 +23,7 @@
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_vblank.h>
 
+#include "av.h"
 #include "dcp.h"
 #include "dcp-internal.h"
 #include "iomfb.h"
@@ -1273,6 +1274,14 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 			jiffies_to_msecs(ret));
 	}
 	dcp->valid_mode = true;
+
+	/*
+	 * Open the audio service only now that the mode is up. Doing it before
+	 * the modeset (as dcp_poweron() used to) makes the firmware disable the
+	 * pipeline mid-modeset on ATC phys. Deferred to a work item so the
+	 * firmware is free to re-modeset in response.
+	 */
+	av_service_connect_deferred(dcp);
 
 	return 0;
 }

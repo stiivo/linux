@@ -290,6 +290,28 @@ static const struct apple_epic_service_ops avep_ops[] = {
 	{}
 };
 
+extern bool hdmi_audio;
+
+/*
+ * Ask for the audio service to be opened from process context, without
+ * blocking the caller.
+ *
+ * Opening DCPAVAudioInterface makes the firmware reconsider the AV interface,
+ * which on ATC phys can trigger another modeset. It must therefore not happen
+ * while a modeset is in flight - see the call site in iomfb_modeset().
+ * av_service_connect() is idempotent (it bails out when the service is already
+ * open), so scheduling this on every modeset is harmless.
+ */
+void av_service_connect_deferred(struct apple_dcp *dcp)
+{
+	struct audiosrv_data *asrv = dcp->audiosrv;
+
+	if (!dcp->avep || !asrv || !hdmi_audio)
+		return;
+
+	schedule_work(&asrv->start_av_service_wq);
+}
+
 void av_service_connect(struct apple_dcp *dcp)
 {
 	struct apple_epic_service *service;
