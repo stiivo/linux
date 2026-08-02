@@ -398,7 +398,7 @@ static int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 	if (dcp->connector_type == DRM_MODE_CONNECTOR_DisplayPort)
 		dptxport_set_hpd(dcp->dptxport[port].service, true);
 
-	if (dcp->avep)
+	if (dcp->avep && hdmi_audio)
 		av_service_connect(dcp);
 
 	return 0;
@@ -1333,7 +1333,7 @@ static int dcp_platform_resume(struct device *dev)
 	if (dcp->hdmi_hpd_irq)
 		enable_irq(dcp->hdmi_hpd_irq);
 
-	if (dcp->avep)
+	if (dcp->avep && hdmi_audio)
 		av_service_connect(dcp);
 
 	return 0;
