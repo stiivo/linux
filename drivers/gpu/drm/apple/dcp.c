@@ -670,8 +670,11 @@ void dcp_poweron(struct platform_device *pdev)
 		break;
 	}
 
-	if (dcp->avep)
-		av_service_connect(dcp);
+	/*
+	 * The audio service is opened from iomfb_modeset() once the mode is
+	 * up. Opening it here, before the modeset, makes the firmware disable
+	 * the pipeline halfway through it on ATC phys.
+	 */
 }
 
 void dcp_poweroff(struct platform_device *pdev)
