@@ -259,7 +259,19 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 		return;
 	}
 
-	if (ep->num_channels >= AFK_MAX_CHANNEL) {
+	/*
+	 * Look for a slot whose service has been disabled and reuse it. The
+	 * firmware re-announces its services on every display power cycle,
+	 * and ->num_channels only ever grew, so ep->services filled up after
+	 * a handful of cycles and every announce from then on was rejected.
+	 * afk_epic_find_service() skips disabled slots, so nothing can still
+	 * reach one by channel number.
+	 */
+	for (ch_idx = 0; ch_idx < ep->num_channels; ch_idx++)
+		if (!ep->services[ch_idx].enabled)
+			break;
+
+	if (ch_idx == ep->num_channels && ep->num_channels >= AFK_MAX_CHANNEL) {
 		dev_err(ep->dcp->dev, "AFK[ep:%02x]: too many enabled services!\n",
 			ep->endpoint);
 		return;
@@ -305,7 +317,8 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 		goto free;
 	}
 
-	ch_idx = ep->num_channels++;
+	if (ch_idx == ep->num_channels)
+		ep->num_channels++;
 	spin_lock_init(&ep->services[ch_idx].lock);
 	ep->services[ch_idx].enabled = true;
 	ep->services[ch_idx].torndown = false;
