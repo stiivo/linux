@@ -326,8 +326,13 @@ static int dcp_pcm_hw_params(struct snd_pcm_substream *substream,
 	struct dma_chan *chan = snd_dmaengine_pcm_get_chan(substream);
 	int ret;
 
-	if (!dcpaud_connection_up(dcpaud))
+	mutex_lock(&dcpaud->data_lock);
+	if (!dcpaud->connected) {
+		mutex_unlock(&dcpaud->data_lock);
 		return -ENXIO;
+	}
+	dcpaud->open_cookie = dcpaud->connection_cookie;
+	mutex_unlock(&dcpaud->data_lock);
 
 	ret = dcpaud_select_cookie(dcpaud, params);
 	if (ret < 0)
@@ -367,8 +372,13 @@ static int dcp_pcm_prepare(struct snd_pcm_substream *substream)
 {
 	struct dcp_audio *dcpaud = substream->pcm->private_data;
 
-	if (!dcpaud_connection_up(dcpaud))
+	mutex_lock(&dcpaud->data_lock);
+	if (!dcpaud->connected) {
+		mutex_unlock(&dcpaud->data_lock);
 		return -ENXIO;
+	}
+	dcpaud->open_cookie = dcpaud->connection_cookie;
+	mutex_unlock(&dcpaud->data_lock);
 
 	return dcp_audiosrv_prepare(dcpaud->dcp_dev,
 				    &dcpaud->selected_cookie);
@@ -496,8 +506,25 @@ static int dcpaud_create_pcm(struct dcp_audio *dcpaud)
 static void dcpaud_report_hotplug(struct dcp_audio *dcpaud, bool connected)
 {
 	struct snd_pcm_substream *substream = dcpaud->substream;
+	bool was_connected = dcpaud->connected;
 
-	if (!dcpaud->card || dcpaud->connected == connected) {
+	/*
+	 * A connect has to invalidate a stream from the previous link even
+	 * when no disconnect was ever reported.
+	 *
+	 * When the DCP restarts it comes back with a fresh audio service and
+	 * without a timing set ("setup_video_limits called on secondary
+	 * display with no timing set"), and disables the pipeline. Nothing
+	 * reports a hotplug, so ->connected stays true here. A substream
+	 * opened before that keeps the link it got from
+	 * dcp_audiosrv_startlink(), which no longer exists: it stays RUNNING
+	 * while hw_ptr never advances again, and nothing errors out. Even a
+	 * successful modeset afterwards does not revive it - only a freshly
+	 * opened substream plays again.
+	 *
+	 * A repeated disconnect stays a no-op.
+	 */
+	if (!dcpaud->card || (was_connected == connected && !connected)) {
 		mutex_unlock(&dcpaud->data_lock);
 		return;
 	}
@@ -507,14 +534,26 @@ static void dcpaud_report_hotplug(struct dcp_audio *dcpaud, bool connected)
 		dcpaud->connection_cookie++;
 	mutex_unlock(&dcpaud->data_lock);
 
-	snd_jack_report(dcpaud->jack, connected ? SND_JACK_AVOUT : 0);
+	if (was_connected != connected)
+		snd_jack_report(dcpaud->jack, connected ? SND_JACK_AVOUT : 0);
 
-	if (!connected) {
-		snd_pcm_stream_lock(substream);
-		if (substream->runtime)
-			snd_pcm_stop(substream, SNDRV_PCM_STATE_DISCONNECTED);
-		snd_pcm_stream_unlock(substream);
-	}
+	/*
+	 * Kick a leftover substream out of RUNNING: on disconnect because the
+	 * link is gone, and on a connect that arrived without one because the
+	 * stream belongs to the previous link.
+	 *
+	 * XRUN rather than SNDRV_PCM_STATE_DISCONNECTED. The device is not
+	 * going away - a plain screen blank tears the service down and brings
+	 * it back moments later. DISCONNECTED is terminal and expects
+	 * userspace to close the descriptor; a client that just keeps polling
+	 * snd_pcm_status() gets -EBADFD forever instead and never recovers
+	 * (7336 times here after a single screen blank). XRUN is the
+	 * recoverable signal every ALSA client already handles: it
+	 * re-prepares, which runs dcp_audiosrv_startlink() against the
+	 * current link.
+	 */
+	if (!connected || was_connected)
+		snd_pcm_stop_xrun(substream);
 }
 
 static int dcpaud_create_jack(struct dcp_audio *dcpaud)
