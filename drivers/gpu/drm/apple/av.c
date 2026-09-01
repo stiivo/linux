@@ -112,6 +112,8 @@ static void av_audiosrv_teardown(struct apple_epic_service *service)
 	struct apple_dcp *dcp = service->ep->dcp;
 	struct audiosrv_data *asrv = dcp->audiosrv;
 
+	service->enabled = false;
+
 	mutex_lock(&asrv->plug_lock);
 
 	down_write(&asrv->srv_rwsem);
