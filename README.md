@@ -11,6 +11,7 @@ Upstream `appledrm.hdmi_audio=1` was experimental and suffered from several issu
 3. **Standby Reconnect Recovery:** When the display woke up, the stream stalled because `open_cookie` was out of sync. Replaced `SNDRV_PCM_STATE_DISCONNECTED` with `snd_pcm_stop_xrun()` and synced cookies on `prepare()`.
 4. **SIO DMA Descriptors & Period Limits:** Fixed descriptor bitmap size (`devm_bitmap_zalloc`) and capped ALSA `periods_max` at 32 to prevent `-ENOMEM` loops under PipeWire.
 5. **Modeset Order:** Audio service initialization is deferred until after `iomfb_modeset()` to prevent display pipeline failures on ATC PHYs.
+6. **Service Teardown, PM Balance & Disconnected State:** Guarded `afk_service_call()` and `dcp_audiosrv_*` against `NULL` service pointers during display standby, balanced runtime PM get/put via `link_started`, and returned `-ENODEV` on disconnected prepare/start to eliminate runaway PipeWire CPU spin loops.
 
 ## Branches
 
