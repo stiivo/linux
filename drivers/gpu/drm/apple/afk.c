@@ -1009,6 +1009,9 @@ int afk_service_call(struct apple_epic_service *service, u16 group, u32 command,
 	u32 retcode;
 	u32 retlen;
 
+	if (!service)
+		return -ENODEV;
+
 	bfr = kzalloc(bfr_len, GFP_KERNEL);
 	if (!bfr)
 		return -ENOMEM;
