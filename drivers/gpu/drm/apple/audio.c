@@ -54,6 +54,7 @@ struct dcp_audio {
 	struct mutex data_lock;
 	bool dcp_connected; /// dcp status keep for delayed initialization
 	bool connected;
+	bool link_started;
 	unsigned int connection_cookie;
 
 	struct snd_pcm_chmap_elem selected_chmap;
@@ -316,6 +317,7 @@ static int dcp_pcm_close(struct snd_pcm_substream *substream)
 {
 	struct dcp_audio *dcpaud = substream->pcm->private_data;
 	dcpaud->selected_chmap.channels = 0;
+	dcpaud->link_started = false;
 
 	return snd_dmaengine_pcm_close(substream);
 }
@@ -397,7 +399,7 @@ static int dcp_pcm_prepare(struct snd_pcm_substream *substream)
 	mutex_unlock(&dcpaud->data_lock);
 
 	if (!connected)
-		return 0;
+		return -ENODEV;
 
 	return dcp_audiosrv_prepare(dcpaud->dcp_dev,
 				    &dcpaud->selected_cookie);
@@ -412,13 +414,16 @@ static int dcp_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 	case SNDRV_PCM_TRIGGER_START:
 	case SNDRV_PCM_TRIGGER_RESUME:
 		if (!dcpaud_connection_up(dcpaud))
-			return -ENXIO;
+			return -ENODEV;
 
 		WARN_ON(pm_runtime_get_sync(dcpaud->dev) < 0);
 		ret = dcp_audiosrv_startlink(dcpaud->dcp_dev,
 					     &dcpaud->selected_cookie);
-		if (ret < 0)
+		if (ret < 0) {
+			pm_runtime_put_sync(dcpaud->dev);
 			return ret;
+		}
+		dcpaud->link_started = true;
 		break;
 
 	case SNDRV_PCM_TRIGGER_STOP:
@@ -430,8 +435,17 @@ static int dcp_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 	}
 
 	ret = snd_dmaengine_pcm_trigger(substream, cmd);
-	if (ret < 0)
+	if (ret < 0) {
+		if (cmd == SNDRV_PCM_TRIGGER_START || cmd == SNDRV_PCM_TRIGGER_RESUME) {
+			if (dcpaud->link_started) {
+				dcpaud->link_started = false;
+				dcp_audiosrv_stoplink(dcpaud->dcp_dev);
+				pm_runtime_mark_last_busy(dcpaud->dev);
+				__pm_runtime_put_autosuspend(dcpaud->dev);
+			}
+		}
 		return ret;
+	}
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
@@ -440,11 +454,14 @@ static int dcp_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 
 	case SNDRV_PCM_TRIGGER_STOP:
 	case SNDRV_PCM_TRIGGER_SUSPEND:
-		ret = dcp_audiosrv_stoplink(dcpaud->dcp_dev);
-		pm_runtime_mark_last_busy(dcpaud->dev);
-		__pm_runtime_put_autosuspend(dcpaud->dev);
-		if (ret < 0)
-			return ret;
+		if (dcpaud->link_started) {
+			dcpaud->link_started = false;
+			ret = dcp_audiosrv_stoplink(dcpaud->dcp_dev);
+			pm_runtime_mark_last_busy(dcpaud->dev);
+			__pm_runtime_put_autosuspend(dcpaud->dev);
+			if (ret < 0)
+				return ret;
+		}
 		break;
 	}
 
