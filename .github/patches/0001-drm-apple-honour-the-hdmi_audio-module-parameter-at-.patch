@@ -1,0 +1,46 @@
+From 37a00b4769a008e3101292c04730149d557f8542 Mon Sep 17 00:00:00 2001
+From: Steven <steven@wilai.de>
+Date: Sun, 2 Aug 2026 20:13:05 +0200
+Subject: [PATCH 1/8] drm: apple: honour the hdmi_audio module parameter at
+ runtime
+
+avep_init() is only run once, when the DCP starts, so dcp->avep stays
+set for the lifetime of the device. The call sites that open the audio
+service check nothing but dcp->avep, which means clearing hdmi_audio at
+runtime has no effect whatsoever - the service keeps being opened on
+every display power cycle. That makes the parameter useless as a way to
+turn the feature off without rebooting, which is unfortunate for a
+feature whose help text calls itself unstable.
+
+Check hdmi_audio at the call sites as well.
+
+Signed-off-by: Steven <steven@wilai.de>
+---
+ drivers/gpu/drm/apple/dcp.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/apple/dcp.c b/drivers/gpu/drm/apple/dcp.c
+index ddd413fdeab2..c94c21f3abfd 100644
+--- a/drivers/gpu/drm/apple/dcp.c
++++ b/drivers/gpu/drm/apple/dcp.c
+@@ -398,7 +398,7 @@ static int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
+ 	if (dcp->connector_type == DRM_MODE_CONNECTOR_DisplayPort)
+ 		dptxport_set_hpd(dcp->dptxport[port].service, true);
+ 
+-	if (dcp->avep)
++	if (dcp->avep && hdmi_audio)
+ 		av_service_connect(dcp);
+ 
+ 	return 0;
+@@ -1333,7 +1333,7 @@ static int dcp_platform_resume(struct device *dev)
+ 	if (dcp->hdmi_hpd_irq)
+ 		enable_irq(dcp->hdmi_hpd_irq);
+ 
+-	if (dcp->avep)
++	if (dcp->avep && hdmi_audio)
+ 		av_service_connect(dcp);
+ 
+ 	return 0;
+-- 
+2.55.0
+
