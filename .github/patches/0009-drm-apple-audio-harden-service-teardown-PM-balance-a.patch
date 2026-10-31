@@ -1,0 +1,212 @@
+From f4ad2eb3ffe5598d291871c1b071a15722f5ff66 Mon Sep 17 00:00:00 2001
+From: Steven <steven@wilai.de>
+Date: Sat, 5 Sep 2026 20:47:43 +0200
+Subject: [PATCH] drm: apple: audio: harden service teardown, PM balance and
+ disconnected state
+
+When a display enters standby, av_audiosrv_teardown() sets asrv->srv to NULL.
+Subsequent trigger STOP calls or remote info queries passed NULL to
+afk_service_call(), resulting in a NULL pointer dereference at offset 0x8
+(service->ep) inside afk_send_command().
+
+Additionally:
+- If playback was attempted while the display was disconnected or in standby,
+  dcp_pcm_prepare() returned 0 (success) while dcp_pcm_trigger(START) returned
+  -ENXIO. Userspace audio servers (PipeWire) reacted by repeatedly attempting
+  to recover via snd_pcm_prepare() followed by snd_pcm_start(), spinning at
+  100% CPU.
+- Runtime PM get/put was unbalanced when startlink failed or when trigger STOP
+  was invoked on a stream whose link had never successfully started, triggering
+  a "Runtime PM usage count underflow!" warning.
+
+Fix these issues by:
+1. Guarding afk_service_call() against a NULL service pointer.
+2. Checking asrv->srv under srv_rwsem in all dcp_audiosrv_* functions.
+3. Returning -ENODEV from dcp_pcm_prepare() and dcp_pcm_trigger(START) when
+   the connection is down, signaling a disconnected device rather than a
+   recoverable underrun.
+4. Tracking dcpaud->link_started so stoplink and runtime PM autosuspend are
+   only executed if the link was actually started, and balancing runtime PM
+   on startlink failure.
+
+Signed-off-by: Steven <steven@wilai.de>
+---
+ drivers/gpu/drm/apple/afk.c   |  3 +++
+ drivers/gpu/drm/apple/audio.c | 35 ++++++++++++++++++++++++++---------
+ drivers/gpu/drm/apple/av.c    | 24 ++++++++++++++++++++++++
+ 3 files changed, 53 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/gpu/drm/apple/afk.c b/drivers/gpu/drm/apple/afk.c
+index 99617e8c57f2..8bda77ce924d 100644
+--- a/drivers/gpu/drm/apple/afk.c
++++ b/drivers/gpu/drm/apple/afk.c
+@@ -1009,6 +1009,9 @@ int afk_service_call(struct apple_epic_service *service, u16 group, u32 command,
+ 	u32 retcode;
+ 	u32 retlen;
+ 
++	if (!service)
++		return -ENODEV;
++
+ 	bfr = kzalloc(bfr_len, GFP_KERNEL);
+ 	if (!bfr)
+ 		return -ENOMEM;
+diff --git a/drivers/gpu/drm/apple/audio.c b/drivers/gpu/drm/apple/audio.c
+index 64ba7f05b11d..494078940545 100644
+--- a/drivers/gpu/drm/apple/audio.c
++++ b/drivers/gpu/drm/apple/audio.c
+@@ -54,6 +54,7 @@ struct dcp_audio {
+ 	struct mutex data_lock;
+ 	bool dcp_connected; /// dcp status keep for delayed initialization
+ 	bool connected;
++	bool link_started;
+ 	unsigned int connection_cookie;
+ 
+ 	struct snd_pcm_chmap_elem selected_chmap;
+@@ -316,6 +317,7 @@ static int dcp_pcm_close(struct snd_pcm_substream *substream)
+ {
+ 	struct dcp_audio *dcpaud = substream->pcm->private_data;
+ 	dcpaud->selected_chmap.channels = 0;
++	dcpaud->link_started = false;
+ 
+ 	return snd_dmaengine_pcm_close(substream);
+ }
+@@ -397,7 +399,7 @@ static int dcp_pcm_prepare(struct snd_pcm_substream *substream)
+ 	mutex_unlock(&dcpaud->data_lock);
+ 
+ 	if (!connected)
+-		return 0;
++		return -ENODEV;
+ 
+ 	return dcp_audiosrv_prepare(dcpaud->dcp_dev,
+ 				    &dcpaud->selected_cookie);
+@@ -412,13 +414,16 @@ static int dcp_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
+ 	case SNDRV_PCM_TRIGGER_START:
+ 	case SNDRV_PCM_TRIGGER_RESUME:
+ 		if (!dcpaud_connection_up(dcpaud))
+-			return -ENXIO;
++			return -ENODEV;
+ 
+ 		WARN_ON(pm_runtime_get_sync(dcpaud->dev) < 0);
+ 		ret = dcp_audiosrv_startlink(dcpaud->dcp_dev,
+ 					     &dcpaud->selected_cookie);
+-		if (ret < 0)
++		if (ret < 0) {
++			pm_runtime_put_sync(dcpaud->dev);
+ 			return ret;
++		}
++		dcpaud->link_started = true;
+ 		break;
+ 
+ 	case SNDRV_PCM_TRIGGER_STOP:
+@@ -430,8 +435,17 @@ static int dcp_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
+ 	}
+ 
+ 	ret = snd_dmaengine_pcm_trigger(substream, cmd);
+-	if (ret < 0)
++	if (ret < 0) {
++		if (cmd == SNDRV_PCM_TRIGGER_START || cmd == SNDRV_PCM_TRIGGER_RESUME) {
++			if (dcpaud->link_started) {
++				dcpaud->link_started = false;
++				dcp_audiosrv_stoplink(dcpaud->dcp_dev);
++				pm_runtime_mark_last_busy(dcpaud->dev);
++				__pm_runtime_put_autosuspend(dcpaud->dev);
++			}
++		}
+ 		return ret;
++	}
+ 
+ 	switch (cmd) {
+ 	case SNDRV_PCM_TRIGGER_START:
+@@ -440,11 +454,14 @@ static int dcp_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
+ 
+ 	case SNDRV_PCM_TRIGGER_STOP:
+ 	case SNDRV_PCM_TRIGGER_SUSPEND:
+-		ret = dcp_audiosrv_stoplink(dcpaud->dcp_dev);
+-		pm_runtime_mark_last_busy(dcpaud->dev);
+-		__pm_runtime_put_autosuspend(dcpaud->dev);
+-		if (ret < 0)
+-			return ret;
++		if (dcpaud->link_started) {
++			dcpaud->link_started = false;
++			ret = dcp_audiosrv_stoplink(dcpaud->dcp_dev);
++			pm_runtime_mark_last_busy(dcpaud->dev);
++			__pm_runtime_put_autosuspend(dcpaud->dev);
++			if (ret < 0)
++				return ret;
++		}
+ 		break;
+ 	}
+ 
+diff --git a/drivers/gpu/drm/apple/av.c b/drivers/gpu/drm/apple/av.c
+index e2178fe90077..f52d0d66df52 100644
+--- a/drivers/gpu/drm/apple/av.c
++++ b/drivers/gpu/drm/apple/av.c
+@@ -134,6 +134,10 @@ int dcp_audiosrv_prepare(struct device *dev, struct dcp_sound_cookie *cookie)
+ 	int ret;
+ 
+ 	down_write(&asrv->srv_rwsem);
++	if (!asrv->srv) {
++		up_write(&asrv->srv_rwsem);
++		return -ENODEV;
++	}
+ 	ret = afk_service_call(asrv->srv, 0, asrv->cmds.prepare, cookie,
+ 			       sizeof(*cookie), 64 - sizeof(*cookie), NULL, 0,
+ 			       64);
+@@ -149,6 +153,10 @@ int dcp_audiosrv_startlink(struct device *dev, struct dcp_sound_cookie *cookie)
+ 	int ret;
+ 
+ 	down_write(&asrv->srv_rwsem);
++	if (!asrv->srv) {
++		up_write(&asrv->srv_rwsem);
++		return -ENODEV;
++	}
+ 	ret = afk_service_call(asrv->srv, 0, asrv->cmds.start_link, cookie,
+ 			       sizeof(*cookie), 64 - sizeof(*cookie), NULL, 0,
+ 			       64);
+@@ -164,6 +172,10 @@ int dcp_audiosrv_stoplink(struct device *dev)
+ 	int ret;
+ 
+ 	down_write(&asrv->srv_rwsem);
++	if (!asrv->srv) {
++		up_write(&asrv->srv_rwsem);
++		return 0;
++	}
+ 	ret = afk_service_call(asrv->srv, 0, asrv->cmds.stop_link, NULL, 0, 64,
+ 			       NULL, 0, 64);
+ 	up_write(&asrv->srv_rwsem);
+@@ -178,6 +190,10 @@ int dcp_audiosrv_unprepare(struct device *dev)
+ 	int ret;
+ 
+ 	down_write(&asrv->srv_rwsem);
++	if (!asrv->srv) {
++		up_write(&asrv->srv_rwsem);
++		return 0;
++	}
+ 	ret = afk_service_call(asrv->srv, 0, asrv->cmds.unprepare, NULL, 0, 64,
+ 			       NULL, 0, 64);
+ 	up_write(&asrv->srv_rwsem);
+@@ -229,6 +245,10 @@ int dcp_audiosrv_get_elements(struct device *dev, void *elements, size_t maxsize
+ 	int ret;
+ 
+ 	down_write(&asrv->srv_rwsem);
++	if (!asrv->srv) {
++		up_write(&asrv->srv_rwsem);
++		return -ENODEV;
++	}
+ 	ret = dcp_audiosrv_osobject_call(asrv->srv, 1, asrv->cmds.get_elements,
+ 					 elements, maxsize, &size);
+ 	up_write(&asrv->srv_rwsem);
+@@ -251,6 +271,10 @@ int dcp_audiosrv_get_product_attrs(struct device *dev, void *attrs, size_t maxsi
+ 	int ret;
+ 
+ 	down_write(&asrv->srv_rwsem);
++	if (!asrv->srv) {
++		up_write(&asrv->srv_rwsem);
++		return -ENODEV;
++	}
+ 	ret = dcp_audiosrv_osobject_call(asrv->srv, 1,
+ 					 asrv->cmds.get_product_attrs, attrs,
+ 					 maxsize, &size);
+-- 
+2.55.0
+

@@ -1,0 +1,67 @@
+name: Sync Upstream Asahi fairydust
+
+on:
+  schedule:
+    # Runs every night at 04:00 UTC
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: fairydust
+          fetch-depth: 0
+
+      - name: Configure Git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch Asahi Linux upstream
+        run: |
+          git remote add upstream https://github.com/AsahiLinux/linux.git
+          git fetch upstream fairydust
+
+      - name: Check for upstream updates
+        id: check
+        run: |
+          UPSTREAM_SHA=$(git rev-parse upstream/fairydust)
+          echo "Upstream HEAD is: $UPSTREAM_SHA"
+          if git merge-base --is-ancestor "$UPSTREAM_SHA" HEAD; then
+            echo "Already up to date with upstream/fairydust."
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New upstream changes or rebase detected."
+            echo "updated=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Rebase patches onto updated upstream
+        if: steps.check.outputs.updated == 'true'
+        run: |
+          # Preserve workflows, patches and README
+          TMP_DIR=$(mktemp -d)
+          cp -r .github "$TMP_DIR/"
+          cp README.md "$TMP_DIR/"
+
+          # Switch to fresh upstream fairydust branch
+          git checkout -B sync-work upstream/fairydust
+
+          # Apply all custom audio and modeset patches
+          git am --3way "$TMP_DIR/.github/patches"/*.patch
+
+          # Restore .github directory and README.md
+          cp -r "$TMP_DIR/.github" .
+          cp "$TMP_DIR/README.md" .
+          git add -f .github
+          git add README.md
+          git commit -m "docs: add README and GitHub Actions sync workflow"
+
+          # Push updated branch to fork
+          git push origin sync-work:fairydust --force

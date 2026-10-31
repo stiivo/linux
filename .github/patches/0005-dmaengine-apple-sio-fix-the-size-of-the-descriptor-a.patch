@@ -1,0 +1,46 @@
+From 2fddbd0ab1320032c5fd6235d85672930a7dbb70 Mon Sep 17 00:00:00 2001
+From: Steven <steven@wilai.de>
+Date: Sun, 2 Aug 2026 20:17:41 +0200
+Subject: [PATCH 5/8] dmaengine: apple-sio: fix the size of the descriptor
+ allocation bitmap
+
+desc_allocated tracks SIO_NO_DESC_SLOTS (64) descriptor slots and is
+used with test_and_set_bit()/clear_bit() over that whole range, but only
+SIO_NO_DESC_SLOTS / 32 == 2 bytes are allocated for it. Everything from
+bit 16 upwards is out of bounds; that it has not blown up so far is down
+to kmalloc() rounding the allocation up.
+
+Use devm_bitmap_zalloc(), which sizes the allocation from the number of
+bits.
+
+Signed-off-by: Steven <steven@wilai.de>
+---
+ drivers/dma/apple-sio.c | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/dma/apple-sio.c b/drivers/dma/apple-sio.c
+index 511f91999ed3..f9747a8d6fec 100644
+--- a/drivers/dma/apple-sio.c
++++ b/drivers/dma/apple-sio.c
+@@ -6,6 +6,7 @@
+  */
+ 
+ #include <linux/bitfield.h>
++#include <linux/bitmap.h>
+ #include <linux/bits.h>
+ #include <linux/completion.h>
+ #include <linux/device.h>
+@@ -715,8 +716,8 @@ static int sio_alloc_shmem(struct sio_data *sio)
+ 		return -ENOMEM;
+ 
+ 	sio->shmem_desc_base = (struct sio_coproc_desc *) (sio->shmem + 56);
+-	sio->desc_allocated = devm_kzalloc(sio->dev, SIO_NO_DESC_SLOTS / 32,
+-					   GFP_KERNEL);
++	sio->desc_allocated = devm_bitmap_zalloc(sio->dev, SIO_NO_DESC_SLOTS,
++						 GFP_KERNEL);
+ 	if (!sio->desc_allocated)
+ 		return -ENOMEM;
+ 
+-- 
+2.55.0
+
