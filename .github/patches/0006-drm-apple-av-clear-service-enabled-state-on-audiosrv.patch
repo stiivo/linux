@@ -1,0 +1,35 @@
+From 39ea4b73d70f9aacce9d688b9f01a6bac68f896b Mon Sep 17 00:00:00 2001
+From: Steven <steven@wilai.de>
+Date: Tue, 1 Sep 2026 22:54:15 +0200
+Subject: [PATCH 6/8] drm: apple: av: clear service enabled state on audiosrv
+ teardown
+
+av_audiosrv_teardown() did not clear service->enabled when the DCP
+DCPAVAudioInterface service was torn down. Consequently,
+afk_recv_handle_init() was unable to reuse disabled channel slots for
+subsequent audio service announcements across display power cycles,
+causing AFK_MAX_CHANNEL exhaustion ("AFK[ep:29]: too many enabled services!").
+
+Clear service->enabled in av_audiosrv_teardown() to allow slot reuse.
+
+Signed-off-by: Steven <steven@wilai.de>
+---
+ drivers/gpu/drm/apple/av.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/drivers/gpu/drm/apple/av.c b/drivers/gpu/drm/apple/av.c
+index 4515712397fa..e2178fe90077 100644
+--- a/drivers/gpu/drm/apple/av.c
++++ b/drivers/gpu/drm/apple/av.c
+@@ -112,6 +112,8 @@ static void av_audiosrv_teardown(struct apple_epic_service *service)
+ 	struct apple_dcp *dcp = service->ep->dcp;
+ 	struct audiosrv_data *asrv = dcp->audiosrv;
+ 
++	service->enabled = false;
++
+ 	mutex_lock(&asrv->plug_lock);
+ 
+ 	down_write(&asrv->srv_rwsem);
+-- 
+2.55.0
+

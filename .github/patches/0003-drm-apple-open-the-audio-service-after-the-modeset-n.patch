@@ -1,0 +1,135 @@
+From 2c43ae23adf8df56e20ff3e0f49524c9cdfda706 Mon Sep 17 00:00:00 2001
+From: Steven <steven@wilai.de>
+Date: Sun, 2 Aug 2026 20:15:26 +0200
+Subject: [PATCH 3/8] drm: apple: open the audio service after the modeset, not
+ before it
+
+dcp_poweron() opens the audio service as its last step, which puts it
+before the modeset userspace issues next. On ATC phys (DP altmode, e.g.
+the USB-C ports of a Mac mini J274) the firmware reacts by disabling the
+pipeline in the middle of the following set_digital_out_mode():
+
+  set_device_enabled_gated: current state: 1, requested state: 0
+  setmode failed
+  ERROR: Modeset done, but pipe not enabled: fDisplayPowerState=0
+  set_digital_out_mode returned 80000104
+
+Every swap is swallowed from then on ("fControllerPowerState is 0"), the
+display never comes back and the compositor blocks for 10 s per commit.
+
+Open the service at the end of a successful modeset instead. Simply
+dropping the call from dcp_poweron() is not enough: it is what restores
+the link after a display power cycle, and without it audio stays dead
+until the connector is unplugged and replugged.
+
+Opening DCPAVAudioInterface makes the firmware reconsider the AV
+interface and can trigger another modeset, so it must not run from the
+modeset path itself - defer it to the work item the driver already has
+for starting the service. av_service_connect() bails out when the
+service is already open, so scheduling it on every modeset is cheap.
+
+Signed-off-by: Steven <steven@wilai.de>
+---
+ drivers/gpu/drm/apple/av.c             | 22 ++++++++++++++++++++++
+ drivers/gpu/drm/apple/av.h             |  2 ++
+ drivers/gpu/drm/apple/dcp.c            |  7 +++++--
+ drivers/gpu/drm/apple/iomfb_template.c |  9 +++++++++
+ 4 files changed, 38 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/apple/av.c b/drivers/gpu/drm/apple/av.c
+index 0d3c752f62d5..4515712397fa 100644
+--- a/drivers/gpu/drm/apple/av.c
++++ b/drivers/gpu/drm/apple/av.c
+@@ -290,6 +290,28 @@ static const struct apple_epic_service_ops avep_ops[] = {
+ 	{}
+ };
+ 
++extern bool hdmi_audio;
++
++/*
++ * Ask for the audio service to be opened from process context, without
++ * blocking the caller.
++ *
++ * Opening DCPAVAudioInterface makes the firmware reconsider the AV interface,
++ * which on ATC phys can trigger another modeset. It must therefore not happen
++ * while a modeset is in flight - see the call site in iomfb_modeset().
++ * av_service_connect() is idempotent (it bails out when the service is already
++ * open), so scheduling this on every modeset is harmless.
++ */
++void av_service_connect_deferred(struct apple_dcp *dcp)
++{
++	struct audiosrv_data *asrv = dcp->audiosrv;
++
++	if (!dcp->avep || !asrv || !hdmi_audio)
++		return;
++
++	schedule_work(&asrv->start_av_service_wq);
++}
++
+ void av_service_connect(struct apple_dcp *dcp)
+ {
+ 	struct apple_epic_service *service;
+diff --git a/drivers/gpu/drm/apple/av.h b/drivers/gpu/drm/apple/av.h
+index c00cbef549fd..f0cc946c44e9 100644
+--- a/drivers/gpu/drm/apple/av.h
++++ b/drivers/gpu/drm/apple/av.h
+@@ -9,9 +9,11 @@
+ #if IS_ENABLED(CONFIG_DRM_APPLE_AUDIO)
+ void av_service_connect(struct apple_dcp *dcp);
+ void av_service_disconnect(struct apple_dcp *dcp);
++void av_service_connect_deferred(struct apple_dcp *dcp);
+ #else
+ static inline void av_service_connect(struct apple_dcp *dcp) { }
+ static inline void av_service_disconnect(struct apple_dcp *dcp) { }
++static inline void av_service_connect_deferred(struct apple_dcp *dcp) { }
+ #endif
+ 
+ #endif /* __AV_H__ */
+diff --git a/drivers/gpu/drm/apple/dcp.c b/drivers/gpu/drm/apple/dcp.c
+index c94c21f3abfd..58f26a5ca11d 100644
+--- a/drivers/gpu/drm/apple/dcp.c
++++ b/drivers/gpu/drm/apple/dcp.c
+@@ -670,8 +670,11 @@ void dcp_poweron(struct platform_device *pdev)
+ 		break;
+ 	}
+ 
+-	if (dcp->avep)
+-		av_service_connect(dcp);
++	/*
++	 * The audio service is opened from iomfb_modeset() once the mode is
++	 * up. Opening it here, before the modeset, makes the firmware disable
++	 * the pipeline halfway through it on ATC phys.
++	 */
+ }
+ 
+ void dcp_poweroff(struct platform_device *pdev)
+diff --git a/drivers/gpu/drm/apple/iomfb_template.c b/drivers/gpu/drm/apple/iomfb_template.c
+index cf40e273a2f4..3373020e3d4a 100644
+--- a/drivers/gpu/drm/apple/iomfb_template.c
++++ b/drivers/gpu/drm/apple/iomfb_template.c
+@@ -23,6 +23,7 @@
+ #include <drm/drm_probe_helper.h>
+ #include <drm/drm_vblank.h>
+ 
++#include "av.h"
+ #include "dcp.h"
+ #include "dcp-internal.h"
+ #include "iomfb.h"
+@@ -1274,6 +1275,14 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
+ 	}
+ 	dcp->valid_mode = true;
+ 
++	/*
++	 * Open the audio service only now that the mode is up. Doing it before
++	 * the modeset (as dcp_poweron() used to) makes the firmware disable the
++	 * pipeline mid-modeset on ATC phys. Deferred to a work item so the
++	 * firmware is free to re-modeset in response.
++	 */
++	av_service_connect_deferred(dcp);
++
+ 	return 0;
+ }
+ 
+-- 
+2.55.0
+
